@@ -56,11 +56,18 @@ def cpp_preprocess(in_path: Path, fake_include_dir: Optional[str]) -> Path:
         raise RuntimeError(f"cpp failed for {in_path}: {stderr}")
     return Path(out_name)
 
+# def remove_comments(text: str) -> str:
+#     text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
+#     text = re.sub(r'//.*', '', text)
+#     return text
 def remove_comments(text: str) -> str:
-    text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
+    def replacer(match):
+        s = match.group()
+        return ''.join('\n' if c == '\n' else ' ' for c in s)
+
+    text = re.sub(r'/\*.*?\*/', replacer, text, flags=re.DOTALL)
     text = re.sub(r'//.*', '', text)
     return text
-
 def preprocess_for_pycparser(pp_path: Path) -> Path:
     out_fd, out_name = tempfile.mkstemp(suffix='.c')
     os.close(out_fd)
