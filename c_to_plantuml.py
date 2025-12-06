@@ -1,4 +1,4 @@
-""" c_to_plantuml.py（修正版 完全版）
+""" c_to_plantuml.py
 Cプロジェクト(.c/.h)から指定関数のPlantUMLシーケンス図(.puml)を生成するツール
 pycparserを用いて各ファイルを解析
 コメント中の [msg数字] が付与された関数呼び出しのみをメッセージ化
@@ -269,6 +269,26 @@ class SequenceBuilder:
             msg_text = f"{assign_target} = {msg_text}"
         return msg_text
 
+    def _emit_local_msg(self, coord, text_msg):
+        """Emit a local message (same lifeline -> same lifeline) if the coord line has a msg id in file_msgs."""
+        if not coord:
+            return False
+        lineno = getattr(coord, 'line', None)
+        if lineno is None:
+            return False
+        srcpath = Path(getattr(coord, 'file')) if getattr(coord, 'file', None) else None
+        msgs = self.file_msgs.get(srcpath, {})
+        if lineno not in msgs:
+            return False
+        msgid = msgs[lineno]
+        # text_msg should be the right-hand expression or whole expr; include msg id
+        src_life = self.lookup_lifeline(self.src_file)
+        # ensure message includes [msgX] prefix if not present
+        if '[msg' not in text_msg:
+            text_msg = f"[msg{msgid}]" + text_msg
+        self.emit(f"{src_life} -> {src_life} : {text_msg}")
+        return True
+
     def _visit_stmt(self, node, parent_is_assignment_or_decl=False):
         if node is None:
             return
@@ -292,10 +312,18 @@ class SequenceBuilder:
                 for e in node.args.exprs:
                     self._visit_stmt(e)
 
-        # 代入式（a = func(); の場合）
+        
+        # 代入式（関数呼び出しを含む場合と、通常代入の両方）
         elif isinstance(node, c_ast.Assignment):
+            # 代入の左辺（文字列）
+            try:
+                left_str = c_generator.CGenerator().visit(node.lvalue)
+            except Exception:
+                left_str = '<lhs>'
+
+            # 右辺が関数呼び出しの場合（既存処理）
             if isinstance(node.rvalue, c_ast.FuncCall):
-                target = c_generator.CGenerator().visit(node.lvalue)
+                target = left_str
                 msg = self._call_message(node.rvalue, assign_target=target)
                 if msg:
                     callee_name = node.rvalue.name.name if isinstance(node.rvalue.name, c_ast.ID) else None
@@ -304,9 +332,23 @@ class SequenceBuilder:
                     callee_life = self.lookup_lifeline(callee_file)
                     src_life = self.lookup_lifeline(self.src_file)
                     self.emit(f"{src_life} -> {callee_life} : {msg}")
-            self._visit_stmt(node.rvalue, parent_is_assignment_or_decl=True)
-
-        # 宣言＋初期化（int a = func(); の場合）
+                # visit RHS expressions for nested calls
+                self._visit_stmt(node.rvalue, parent_is_assignment_or_decl=True)
+            else:
+                # 右辺が関数呼び出しでない通常代入 (例: a = ret; a += 3;)
+                # 出力対象の行に [msgX] があるか確認してメッセージを出す
+                try:
+                    right_str = c_generator.CGenerator().visit(node.rvalue)
+                except Exception:
+                    right_str = '<expr>'
+                coord = getattr(node, 'coord', None)
+                # compose message text without duplicating [msgX]
+                text_msg = f"{left_str} = {right_str}"
+                emitted = self._emit_local_msg(coord, text_msg)
+                # still traverse the rvalue to catch nested calls or unary ops inside
+                self._visit_stmt(node.rvalue, parent_is_assignment_or_decl=True)
+        
+        # 宣言＋初期化（初期化子が関数呼び出しの場合）
         elif isinstance(node, c_ast.Decl) and getattr(node, 'init', None) and isinstance(node.init, c_ast.FuncCall):
             target = node.name
             msg = self._call_message(node.init, assign_target=target)
@@ -318,6 +360,48 @@ class SequenceBuilder:
                 src_life = self.lookup_lifeline(self.src_file)
                 self.emit(f"{src_life} -> {callee_life} : {msg}")
             self._visit_stmt(node.init, parent_is_assignment_or_decl=True)
+
+        # 宣言＋初期化（初期化子が関数呼び出しでない場合：リテラルや変数代入を表現）
+        elif isinstance(node, c_ast.Decl) and getattr(node, 'init', None):
+            # 例: int a = 1; /*[msgX]*/ や int a = b;
+            try:
+                target = node.name
+            except Exception:
+                target = '<var>'
+            coord = getattr(node, 'coord', None)
+            try:
+                init_str = c_generator.CGenerator().visit(node.init)
+            except Exception:
+                init_str = '<expr>'
+            text_msg = f"{target} = {init_str}"
+            self._emit_local_msg(coord, text_msg)
+            # visit init to find nested calls if any
+            self._visit_stmt(node.init, parent_is_assignment_or_decl=True)
+        # 単項演算子（インクリメント / デクリメントなど）
+        elif isinstance(node, c_ast.UnaryOp):
+            # node.op examples: 'p++' (post-increment), 'p--', '++', '--', '&', '*', etc.
+            # We target increments/decrements and similar mutation ops.
+            try:
+                op = node.op
+            except Exception:
+                op = None
+            # get expression string for message
+            try:
+                expr_str = c_generator.CGenerator().visit(node)
+            except Exception:
+                expr_str = '<unary>'
+            coord = getattr(node, 'coord', None)
+            # Consider common increment/decrement op representations
+            if op in ('p++', 'p--', '++', '--'):
+                # emit message like "b++" if /*[msgX]*/ present on this line
+                self._emit_local_msg(coord, expr_str)
+            # still visit child expr
+            try:
+                child = getattr(node, 'expr', None)
+                if child is not None:
+                    self._visit_stmt(child)
+            except Exception:
+                pass
 
         # if / else
         elif isinstance(node, c_ast.If):
